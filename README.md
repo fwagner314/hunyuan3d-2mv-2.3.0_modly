@@ -1,4 +1,4 @@
-# Hunyuan3D-2mv — Modly Extension (v2.2)
+# Hunyuan3D-2mv — Modly Extension (v2.3)
 
 Generate textured 3D meshes from images using Tencent's Hunyuan3D-2mv. Three nodes:
 
@@ -8,7 +8,10 @@ Generate textured 3D meshes from images using Tencent's Hunyuan3D-2mv. Three nod
 | **Texture Mesh** | Paints a texture onto an existing mesh using reference photos |
 | **Apply Texture** | Maps an existing UV atlas (e.g. externally super-resolved) onto a UV'd mesh — no diffusion |
 
-### What's new in v2.2
+### What's new in v2.3
+- **Texture color and UV repair** — the texture bridge preserves multiview color/exposure, avoids global atlas color matching, fixes the renderer mesh tuple order, and fills sparse UV charts using chart-local pixels with nearby 3D surface colors as fallback.
+
+### What was new in v2.2
 - **Self-contained install** — `setup.py` now installs *every* runtime dependency (torch + hy3dgen + scipy + scikit-image + onnxruntime + rembg + trimesh + …) into the isolated venv, including a `pip install .` packaging mode for GitHub users. No manual dependency steps.
 - **Machine-specific CUDA rasterizer** — the texture renderer is compiled during installation for the detected NVIDIA GPU instead of shipping a binary for one fixed GPU architecture. The generated `.pyd` is stored in the extension and copied into its venv.
 - **Weights stay in Modly** — all model weights are still downloaded through the extension's nodes in Modly's **Extensions → model** view (per-node `hf_repo` / download check). Nothing model-related ships in the repo.

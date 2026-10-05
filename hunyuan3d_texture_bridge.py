@@ -50,65 +50,61 @@ def _start_watchdog():
 
 
 def _histogram_match_pil(src_img, ref_img, mask=None, strength=1.0):
-    """Match the colour distribution of *src_img* to *ref_img*.
+    """Gently match a generated view to the subject colors in a reference.
 
-    Works in LAB space so luminance and chrominance are handled separately.
-    When *mask* is provided (float tensor HxWx1, >0.5 = foreground), only
-    foreground pixels are used to compute statistics and the correction is
-    blended back via the mask.  *strength* controls how aggressively the
-    correction is applied (0 = no change, 1 = full match).
-
-    Returns a PIL RGB image.
+    The generated-view mask and the reference subject mask are found
+    independently: their silhouettes need not occupy the same pixels. Only
+    foreground pixels are changed, so white/gray backdrops cannot wash out the
+    texture.
     """
     import cv2 as _cv2
 
     src = np.array(src_img.convert("RGB")).astype(np.float32)
-    # The foreground mask is indexed against BOTH arrays below, so the
-    # reference must be resampled to the source's dimensions first.
     if ref_img.size != src_img.size:
         ref_img = ref_img.resize(src_img.size, Image.LANCZOS)
     ref = np.array(ref_img.convert("RGB")).astype(np.float32)
-
-    # Convert to LAB (OpenCV uses L in [0,255], a/b in [0,255] centred at 128)
     src_lab = _cv2.cvtColor(src.astype(np.uint8), _cv2.COLOR_RGB2LAB).astype(np.float32)
     ref_lab = _cv2.cvtColor(ref.astype(np.uint8), _cv2.COLOR_RGB2LAB).astype(np.float32)
 
-    # Build foreground mask
     if mask is not None:
-        fg = (mask.squeeze(-1).cpu().numpy() if hasattr(mask, "cpu")
-              else np.asarray(mask)).astype(np.float32)
-        if fg.ndim == 2:
-            fg = fg > 0.5
-        else:
-            fg = fg[:, :, 0] > 0.5
+        fg = (mask.cpu().numpy() if hasattr(mask, "cpu") else np.asarray(mask))
+        fg = np.asarray(fg).astype(np.float32)
+        if fg.ndim == 3:
+            fg = fg[:, :, 0]
         if fg.shape != src_lab.shape[:2]:
             fg = _cv2.resize(fg.astype(np.uint8) * 255,
                              (src_lab.shape[1], src_lab.shape[0]),
                              interpolation=_cv2.INTER_NEAREST) > 127
+        else:
+            fg = fg > 0.5
     else:
-        fg = np.ones(src.shape[:2], dtype=bool)
+        fg = np.ones(src_lab.shape[:2], dtype=bool)
 
-    if fg.sum() < 100:
-        # Too few foreground pixels — return unchanged
+    if int(fg.sum()) < 100:
         return src_img
 
-    corrected = src_lab.copy()
-    for ch in range(3):  # L, a, b
-        src_vals = src_lab[:, :, ch][fg]
-        ref_vals = ref_lab[:, :, ch][fg]
+    try:
+        ref_fg = _subject_silhouette(ref.astype(np.uint8))
+        ref_coverage = float(ref_fg.mean())
+        if not (0.02 < ref_coverage < 0.98) or int(ref_fg.sum()) < 100:
+            ref_fg = np.ones(ref_lab.shape[:2], dtype=bool)
+    except Exception:
+        ref_fg = np.ones(ref_lab.shape[:2], dtype=bool)
 
+    corrected = src_lab.copy()
+    for ch in range(3):
+        src_vals = src_lab[:, :, ch][fg]
+        ref_vals = ref_lab[:, :, ch][ref_fg]
         src_mean, src_std = src_vals.mean(), src_vals.std() + 1e-6
         ref_mean, ref_std = ref_vals.mean(), ref_vals.std() + 1e-6
-
-        # Linear colour transfer scaled by strength
-        corrected[:, :, ch] = np.clip(
+        candidate = np.clip(
             (src_lab[:, :, ch] - src_mean) * (ref_std / src_std) * strength
             + src_mean + strength * (ref_mean - src_mean),
             0, 255)
+        corrected[:, :, ch][fg] = candidate[fg]
 
     result = _cv2.cvtColor(corrected.astype(np.uint8), _cv2.COLOR_LAB2RGB)
     return Image.fromarray(result)
-
 
 def _flatten_texture(pil_img, strength=0.8):
     """Remove shadows and highlights from a texture, producing flat albedo.
@@ -712,7 +708,7 @@ def texture_mesh(args):
       render normal/position multiviews -> delight conditioning image ->
       multiview diffusion -> bake textures -> inpaint -> export GLB.
     """
-    BRIDGE_BUILD = "2026-09-14-alignment"
+    BRIDGE_BUILD = "2026-10-04-chart-fill-color-preserve"
     print(json.dumps({"type": "log", "message":
         f"[texture] bridge build {BRIDGE_BUILD}"}), flush=True)
     _bridge_first_load(args)
@@ -782,23 +778,15 @@ def texture_mesh(args):
     # geometry, so the baked texture carries the real original pixels.
     _raw_cond_views = [v.convert("RGB").copy() for v in cond_views]
 
-    # Dynamic view weights graduated to avoid competition at view boundaries.
-    # Front view (index 0) gets highest weight; sides (1,3) moderate;
-    # back (2), top (4), bottom (5) lower — they fill gaps without dominating.
-    _known_weights = [1.0] * 6
-    _dynamic_weights = [1.0] * 6
-    _num_known = min(len(cond_views), 6)
-    for _i in range(_num_known):
-        _dynamic_weights[_i] = _known_weights[_i]
+    # Equal diffusion-view weights preserve the model's saturated colors.
+    # Hybrid mode prioritizes directly supplied reference views over generated
+    # views where their UV projections overlap.
     if texture_method == "hybrid":
-        # Hybrid reference-backed views are ground-truth originals (TPS-warped
-        # to the mesh silhouette), so they take full bake weight. Views past the
-        # reference count are diffusion output and get graduated weights so they
-        # cannot ghost over a real reference where projections overlap (e.g. the
-        # top view bleeding onto the shoulders of the back reference).
         _stock_grad = [1.0, 0.1, 0.5, 0.1, 0.05, 0.05]
         _dynamic_weights = [1.0 if _i < len(cond_views) else _stock_grad[_i]
                             for _i in range(6)]
+    else:
+        _dynamic_weights = [1.0] * 6
     _view_weights_override = _dynamic_weights
     print(json.dumps({"type": "log", "message": f"[texture] dynamic view weights: {_view_weights_override}"}), flush=True)
 
@@ -1188,174 +1176,154 @@ def texture_mesh(args):
     pipeline.render.bake_unreliable_kernel_size = 2
 
     import cv2 as _cv2
-    from hy3dgen.texgen.differentiable_renderer.mesh_processor import meshVerticeInpaint as _mvi_orig
+    def _chart_inpaint(texture, mask, vtx_pos, pos_idx, vtx_uv, uv_idx):
+        """Fill UV charts from their own baked pixels and nearby surface color."""
+        from scipy.sparse import coo_matrix
+        from scipy.sparse.csgraph import connected_components
+        from scipy.spatial import cKDTree
 
-    def _fill_tri(tex, mask, uv0, uv1, uv2, c0, c1, c2, W, H):
-        """Fill a triangle in UV space with barycentric-interpolated colors."""
-        x0, y0 = float(uv0[0]) * (W - 1), (1.0 - float(uv0[1])) * (H - 1)
-        x1, y1 = float(uv1[0]) * (W - 1), (1.0 - float(uv1[1])) * (H - 1)
-        x2, y2 = float(uv2[0]) * (W - 1), (1.0 - float(uv2[1])) * (H - 1)
-        min_x, max_x = max(0, int(min(x0, x1, x2))), min(W - 1, int(max(x0, x1, x2)))
-        min_y, max_y = max(0, int(min(y0, y1, y2))), min(H - 1, int(max(y0, y1, y2)))
-        if min_x > max_x or min_y > max_y:
-            return
-        xs = np.arange(min_x, max_x + 1, dtype=np.float32)
-        ys = np.arange(min_y, max_y + 1, dtype=np.float32)
-        XX, YY = np.meshgrid(xs, ys, indexing="xy")
-        denom = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2)
-        if abs(denom) < 1e-10:
-            return
-        W0 = ((y1 - y2) * (XX - x2) + (x2 - x1) * (YY - y2)) / denom
-        W1 = ((y2 - y0) * (XX - x2) + (x0 - x2) * (YY - y2)) / denom
-        W2 = 1.0 - W0 - W1
-        inside = (W0 >= -0.001) & (W1 >= -0.001) & (W2 >= -0.001)
-        if not inside.any():
-            return
-        color = W0[..., None] * c0 + W1[..., None] * c1 + W2[..., None] * c2
-        color = np.clip(color, 0, 1)
-        fill_mask = inside & (mask[min_y:max_y + 1, min_x:max_x + 1] == 0)
-        if not fill_mask.any():
-            return
-        tex[min_y:max_y + 1, min_x:max_x + 1][fill_mask] = color[fill_mask]
-        mask[min_y:max_y + 1, min_x:max_x + 1][fill_mask] = 255
+        image = (np.clip(texture, 0, 1) * 255).astype(np.uint8)
+        height, width, channels = image.shape
+        if channels != 3:
+            raise ValueError(f"UV inpaint expects an RGB texture, got {image.shape}")
+        bake_mask = np.asarray(mask).squeeze()
+        if bake_mask.shape != (height, width):
+            raise ValueError(
+                f"UV mask shape {bake_mask.shape} does not match texture {(height, width)}")
+        uvs = np.asarray(vtx_uv, dtype=np.float32)
+        faces = np.asarray(uv_idx, dtype=np.int64)
+        if uvs.ndim != 2 or uvs.shape[1] != 2:
+            raise ValueError(f"UV vertices must have shape (N, 2), got {uvs.shape}")
+        if faces.ndim != 2 or faces.shape[1] != 3:
+            raise ValueError(f"UV faces must be triangles, got {faces.shape}")
+        if faces.size and (faces.min() < 0 or faces.max() >= len(uvs)):
+            raise ValueError("UV face indices are outside the UV vertex array")
+        if not faces.size or not np.any(bake_mask):
+            return image
 
-    def _patched_mvis(texture, mask, vtx_pos, vtx_uv, pos_idx, uv_idx):
-        H, W, C = texture.shape
-        V = vtx_pos.shape[0]
-        vtx_mask = np.zeros(V, dtype=np.float32)
-        vtx_color = [np.zeros(C, dtype=np.float32) for _ in range(V)]
-        uncolored = []
-        G = [[] for _ in range(V)]
-        for i in range(uv_idx.shape[0]):
-            for k in range(3):
-                uv_i = uv_idx[i, k]
-                v_i = pos_idx[i, k]
-                u = int(round(vtx_uv[uv_i, 0] * (W - 1)))
-                v = int(round((1.0 - vtx_uv[uv_i, 1]) * (H - 1)))
-                if mask[v, u] > 0:
-                    vtx_mask[v_i] = 1.0
-                    vtx_color[v_i] = texture[v, u]
-                else:
-                    uncolored.append(v_i)
-                G[pos_idx[i, k]].append(pos_idx[i, (k + 1) % 3])
+        px = np.clip(np.rint(uvs[:, 0] * (width - 1)).astype(np.int32), 0, width - 1)
+        py = np.clip(np.rint((1 - uvs[:, 1]) * (height - 1)).astype(np.int32), 0, height - 1)
+        rows = np.concatenate((faces[:, 0], faces[:, 1], faces[:, 2]))
+        cols = np.concatenate((faces[:, 1], faces[:, 2], faces[:, 0]))
+        graph = coo_matrix(
+            (np.ones(len(rows), dtype=np.uint8), (rows, cols)),
+            shape=(len(uvs), len(uvs))).tocsr()
+        chart_count, labels = connected_components(graph, directed=False)
+        face_labels = labels[faces[:, 0]]
+        face_order = np.argsort(face_labels, kind="stable")
+        face_starts = np.concatenate((
+            [0], np.cumsum(np.bincount(face_labels, minlength=chart_count))))
+        vertex_order = np.argsort(labels, kind="stable")
+        vertex_starts = np.concatenate((
+            [0], np.cumsum(np.bincount(labels, minlength=chart_count))))
 
-        smooth_count = 8
-        prev = 0
-        while smooth_count > 0:
-            nc = 0
-            for v_i in uncolored:
-                v0 = vtx_pos[v_i]
-                acc = []
-                for n_i in G[v_i]:
-                    if vtx_mask[n_i] > 0:
-                        d = max(np.sqrt(np.sum((v0 - vtx_pos[n_i])**2)), 1e-4)
-                        acc.append((vtx_color[n_i], 1.0 / (d * d)))
-                if not acc:
-                    nc += 1
-                    continue
-                wsum = sum(a for _, a in acc)
-                base = sum(c * a for c, a in acc) / wsum
-                _thresh = 0.15
-                kept = [(c, w) for c, w in acc
-                        if np.sqrt(np.sum((c - base) ** 2)) <= _thresh]
-                if not kept:
-                    nc += 1
-                    continue
-                wsum = sum(w for _, w in kept)
-                vtx_color[v_i] = sum(c * w for c, w in kept) / wsum
-                vtx_mask[v_i] = 1.0
-            if prev == nc:
-                smooth_count -= 1
-            else:
-                smooth_count += 1
-            prev = nc
+        # xatlas normally gives matching position and UV indices. If it does
+        # not, reconstruct 3D positions from corresponding face corners. UV
+        # coordinates remain a safe fallback for other renderer layouts.
+        positions = uvs
+        mesh_positions = np.asarray(vtx_pos, dtype=np.float32)
+        mesh_faces = np.asarray(pos_idx, dtype=np.int64)
+        if (len(mesh_positions) == len(uvs) and
+                mesh_faces.shape == faces.shape and np.array_equal(mesh_faces, faces)):
+            positions = mesh_positions
+        elif mesh_faces.shape == faces.shape and mesh_faces.size and (
+                mesh_faces.min() >= 0 and mesh_faces.max() < len(mesh_positions)):
+            uv_flat = faces.ravel()
+            mesh_flat = mesh_faces.ravel()
+            counts = np.bincount(uv_flat, minlength=len(uvs)).astype(np.float32)
+            positions = np.zeros((len(uvs), mesh_positions.shape[1]), dtype=np.float32)
+            for axis in range(mesh_positions.shape[1]):
+                positions[:, axis] = np.bincount(
+                    uv_flat, weights=mesh_positions[mesh_flat, axis],
+                    minlength=len(uvs)) / np.maximum(counts, 1)
 
-        new_tex = texture.copy()
-        new_mask = mask.copy()
-        _fallback = np.zeros(C, dtype=np.float32)
-        _fc = 0
-        for v_i in range(V):
-            if vtx_mask[v_i] > 0:
-                _fallback += vtx_color[v_i]
-                _fc += 1
-        if _fc > 0:
-            _fallback /= _fc
-        for i in range(uv_idx.shape[0]):
-            v0_i, v1_i, v2_i = pos_idx[i, 0], pos_idx[i, 1], pos_idx[i, 2]
-            if not (vtx_mask[v0_i] > 0 or vtx_mask[v1_i] > 0 or vtx_mask[v2_i] > 0):
+        def chart_region(chart_id):
+            part = face_order[face_starts[chart_id]:face_starts[chart_id + 1]]
+            if part.size == 0:
+                return None
+            ids = vertex_order[vertex_starts[chart_id]:vertex_starts[chart_id + 1]]
+            x0 = max(0, int(px[ids].min()) - 2)
+            x1 = min(width, int(px[ids].max()) + 3)
+            y0 = max(0, int(py[ids].min()) - 2)
+            y1 = min(height, int(py[ids].max()) + 3)
+            occupancy = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+            for face in faces[part]:
+                points = np.column_stack((px[face] - x0, py[face] - y0))
+                _cv2.fillConvexPoly(occupancy, points, 255)
+            known = (occupancy > 0) & (bake_mask[y0:y1, x0:x1] > 0)
+            return ids, x0, x1, y0, y1, occupancy, known
+
+        # A single projected texel is not enough to choose the color of an
+        # entire island. Use well-sampled charts as 3D nearest neighbors for
+        # islands with zero or one baked pixels.
+        support_counts = np.zeros(chart_count, dtype=np.int64)
+        support_colors = np.zeros((chart_count, 3), dtype=np.uint8)
+        for chart_id in range(chart_count):
+            region = chart_region(chart_id)
+            if region is None:
                 continue
-            uv0 = vtx_uv[uv_idx[i, 0]]
-            uv1 = vtx_uv[uv_idx[i, 1]]
-            uv2 = vtx_uv[uv_idx[i, 2]]
-            c0 = vtx_color[v0_i] if vtx_mask[v0_i] > 0 else _fallback
-            c1 = vtx_color[v1_i] if vtx_mask[v1_i] > 0 else _fallback
-            c2 = vtx_color[v2_i] if vtx_mask[v2_i] > 0 else _fallback
-            _fill_tri(new_tex, new_mask, uv0, uv1, uv2, c0, c1, c2, W, H)
+            _, x0, x1, y0, y1, _, known = region
+            support_counts[chart_id] = int(known.sum())
+            if support_counts[chart_id] >= 2:
+                support_colors[chart_id] = np.median(
+                    image[y0:y1, x0:x1][known], axis=0).astype(np.uint8)
+        support_ids = np.flatnonzero(support_counts[labels] >= 2)
+        if not support_ids.size:
+            holes = np.where(bake_mask > 0, 0, 255).astype(np.uint8)
+            return _cv2.inpaint(image, holes, 3, _cv2.INPAINT_TELEA)
+        support_tree = cKDTree(positions[support_ids])
 
-        return new_tex, new_mask
+        output = image.copy()
+        core_mask = np.zeros((height, width), dtype=np.uint8)
+        sparse_charts = 0
+        for chart_id in range(chart_count):
+            region = chart_region(chart_id)
+            if region is None:
+                continue
+            ids, x0, x1, y0, y1, occupancy, known = region
+            occupied = occupancy > 0
+            if not occupied.any():
+                continue
+            chart_image = image[y0:y1, x0:x1].copy()
+            if support_counts[chart_id] >= 2:
+                chart_image[~known] = 0
+                holes = np.where(known, 0, 255).astype(np.uint8)
+                if holes.any():
+                    chart_image = _cv2.inpaint(chart_image, holes, 3, _cv2.INPAINT_TELEA)
+            else:
+                sparse_charts += 1
+                distances, near_indices = support_tree.query(positions[ids])
+                nearest = near_indices[np.argmin(distances)]
+                source_chart = labels[support_ids[nearest]]
+                chart_image[:] = support_colors[source_chart]
+            output[y0:y1, x0:x1][occupied] = chart_image[occupied]
+            core_mask[y0:y1, x0:x1][occupied] = 255
 
-    def _patched_mvi(texture, mask, vtx_pos, vtx_uv, pos_idx, uv_idx):
-        return _patched_mvis(texture, mask, vtx_pos, vtx_uv, pos_idx, uv_idx)
+        # Preserve all directly baked texels, including thin triangles that
+        # rasterize between pixel centers and fall outside the chart mask.
+        remaining = np.where((core_mask > 0) | (bake_mask > 0), 0, 255).astype(np.uint8)
+        if remaining.any():
+            output = _cv2.inpaint(output, remaining, 3, _cv2.INPAINT_TELEA)
+        print(json.dumps({"type": "log", "message":
+            f"[texture] UV chart fill: {chart_count} components, "
+            f"{sparse_charts} sparse charts, "
+            f"{float((core_mask > 0).mean()):.1%} chart coverage"}), flush=True)
+        return output
 
-    def _patched_uv_inpaint(self, texture, mask, _radius=10):
+    def _patched_uv_inpaint(self, texture, mask):
         if isinstance(texture, np.ndarray):
             tex_np = texture
         elif isinstance(texture, Image.Image):
-            tex_np = np.array(texture) / 255.0
+            tex_np = np.asarray(texture).astype(np.float32) / 255.0
         else:
             tex_np = texture.cpu().numpy()
-        # Pixels the bake actually painted. Everything else was never visible
-        # from any camera and must be synthesized.
-        _unpainted = (np.asarray(mask) <= 0)
+        if tex_np.dtype == np.uint8 or (tex_np.size and float(np.nanmax(tex_np)) > 1.5):
+            tex_np = tex_np.astype(np.float32) / 255.0
         vtx_pos, pos_idx, vtx_uv, uv_idx = self.get_mesh()
-        tex_np, mask = _patched_mvi(tex_np, mask, vtx_pos, vtx_uv, pos_idx, uv_idx)
-        img = (tex_np * 255).clip(0, 255).astype(np.uint8)
-        # Pass 1: fill residual pixel gaps (TELEA preserves texture better
-        # than NS for natural imagery).
-        hole = 255 - mask
-        if hole.sum() > 0:
-            img = _cv2.inpaint(img, hole, _radius, _cv2.INPAINT_TELEA)
-        # Pass 2: catch remaining seam cracks (Canny-detected) with small radius.
-        # Restrict to pixels inside the original hole so we don't inpaint over
-        # already-baked detail (grid lines, color boundaries, etc.).
-        hole2 = _cv2.Canny(img, 10, 50)
-        hole2 = _cv2.dilate(hole2, None, iterations=3)
-        hole2 = hole2 & (255 - mask)
-        if hole2.sum() > 0:
-            img = _cv2.inpaint(img, hole2, max(2, _radius // 3), _cv2.INPAINT_TELEA)
-        # Detail restore: formerly-unpainted regions come out as smooth blur
-        # from the propagation above. Copy high-frequency detail sampled from
-        # the nearest painted texel (with jitter to avoid blocky stamping),
-        # scaled by the local texture energy of the source area — flat skin
-        # stays clean, busy fabric gets matching grain.
-        if _unpainted.any():
-            from scipy.ndimage import distance_transform_edt
-            _painted = ~_unpainted
-            _dist, _inds = distance_transform_edt(_painted, return_indices=True)
-            _flt = img.astype(np.float32)
-            _detail = _flt - _cv2.GaussianBlur(img, (0, 0), 3).astype(np.float32)
-            _energy = _cv2.GaussianBlur(np.abs(_detail), (0, 0), 8)
-            _rng = np.random.default_rng(7)
-            _ny = np.clip(_inds[0][_unpainted] + _rng.integers(-6, 7, size=_unpainted.sum()),
-                          0, _flt.shape[0] - 1)
-            _nx = np.clip(_inds[1][_unpainted] + _rng.integers(-6, 7, size=_unpainted.sum()),
-                          0, _flt.shape[1] - 1)
-            _gain = np.clip(_energy[_inds[0][_unpainted], _inds[1][_unpainted]] / 255.0,
-                            0.0, 0.6).astype(np.float32)
-            _flt[_unpainted] = np.clip(
-                _flt[_unpainted] + _detail[_ny, _nx] * _gain * 0.6, 0, 255)
-            img = _flt.astype(np.uint8)
-        # Feather the boundary ring between painted and unpainted regions so
-        # the transition reads as one continuous surface.
-        _bw = 3
-        _k = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (2 * _bw + 1,) * 2)
-        _band = _cv2.dilate(_unpainted.astype(np.uint8), _k) & (~_unpainted).astype(np.uint8)
-        if _band.any():
-            _flt = img.astype(np.float32)
-            _blur = _cv2.GaussianBlur(img, (0, 0), 2.0).astype(np.float32)
-            _flt[_band > 0] = 0.55 * _flt[_band > 0] + 0.45 * _blur[_band > 0]
-            img = _flt.astype(np.uint8)
-        return img  # uint8 [0,255] for pipeline.texture_inpaint which does /255
+        print(json.dumps({"type": "log", "message":
+            f"[texture] UV seam fill: {len(vtx_uv)} UV vertices, "
+            f"{len(uv_idx)} UV faces, {len(pos_idx)} position faces"}), flush=True)
+        return _chart_inpaint(tex_np, mask, vtx_pos, pos_idx, vtx_uv, uv_idx)
 
     import types
     pipeline.render.uv_inpaint = types.MethodType(_patched_uv_inpaint, pipeline.render)
@@ -1565,16 +1533,11 @@ def texture_mesh(args):
     except Exception as _e:
         print("[diversity report skipped] %s" % _e)
 
-    # ── Per-view luminance balance ────────────────────────────────────────
-    # The multiview diffusion model has a training bias: it generates objects
-    # lit from the front-right, making left/back/bottom views darker.  This
-    # step equalises mean luminance across all 6 views BEFORE colour matching
-    # so the baked texture doesn't inherit directional shadows.
-    # Statistics are computed on the SUBJECT ONLY (corner flood-fill mask):
-    # the generated views sit on a flat gray background while the reference
-    # sits on white, and mixing the backgrounds into the stats made the old
-    # correction mostly brighten background instead of the object.
-    _norm_log = "[texture] "
+    # ── Preserve view colors/exposure for baking ──────────────────────────
+    # The diffusion views already have consistent neutral lighting. Per-view
+    # luminance and histogram matching shifted their colors away from the
+    # generated views (and from the reference), so preserve the images here.
+    # Keep only the subject masks for silhouette edge cleanup below.
     _fg_masks = []
     for _v in multiviews:
         try:
@@ -1583,45 +1546,11 @@ def texture_mesh(args):
             _fg_masks.append(_m if 0.02 < _cov < 0.98 else None)
         except Exception:
             _fg_masks.append(None)
-    try:
-        import cv2 as _cv2_lb
-        _mv_lums = []
-        for _vi, _v in enumerate(multiviews):
-            _lab = _cv2_lb.cvtColor(np.array(_v.convert("RGB")), _cv2_lb.COLOR_RGB2LAB)
-            _m = _fg_masks[_vi]
-            _mv_lums.append(float(_lab[:, :, 0][_m].mean()) if _m is not None
-                            else float(_lab[:, :, 0].mean()))
-        # Target the MEDIAN view luminance, not the max: max over-boosted the
-        # darker side views (washing legs to pale/metallic) whenever one view
-        # happened to be brightest. Median equalises without over-driving.
-        _target_lum = float(np.median(_mv_lums))
-        _lum_ratios = [_target_lum / max(l, 1.0) for l in _mv_lums]
-        _lum_ratios = [np.clip(r, 0.3, 4.0) for r in _lum_ratios]
-        for _i, _v in enumerate(multiviews):
-            _lab = _cv2_lb.cvtColor(np.array(_v.convert("RGB")), _cv2_lb.COLOR_RGB2LAB).astype(np.float32)
-            _lab[:, :, 0] = np.clip(_lab[:, :, 0] * _lum_ratios[_i], 0, 255)
-            multiviews[_i] = Image.fromarray(_cv2_lb.cvtColor(_lab.astype(np.uint8), _cv2_lb.COLOR_LAB2RGB))
-        _lum_info = [f"{n}:{l:.0f}->{l*r:.0f}" for n, l, r in zip(_mv_names, _mv_lums, _lum_ratios)]
-        _norm_log += f"luminance balanced, subject-only (cap 4.0) ({', '.join(_lum_info)})"
-    except Exception as _lb_err:
-        _norm_log += f" (luminance balance skipped: {_lb_err})"
-
-    # ── Colour-match to source reference ──────────────────────────────────
-    # After luminance is even, match the colour palette to the source.
-    # Foreground masks restrict the statistics to the subject so the gray
-    # diffusion background vs white reference background mismatch doesn't
-    # dilute the correction (this was why dark views stayed dark).
-    try:
-        for _i, _v in enumerate(multiviews):
-            multiviews[_i] = _histogram_match_pil(_v, _source_histogram_ref,
-                                                  mask=_fg_masks[_i], strength=0.85)
-        _norm_log += " | source colour matched (strength=0.85, subject-only)"
-    except Exception as _norm_err:
-        _norm_log += f" (colour match skipped: {_norm_err})"
+    print(json.dumps({"type": "log", "message":
+        "[texture] preserving multiview colors and exposure; per-view normalization skipped"}), flush=True)
     # Save views for debug comparison
     for _i, (_v, _n) in enumerate(zip(multiviews, _mv_names)):
-        _v.save(os.path.join(_debug_dir, f"03b_normalized_{_i}_{_n}.png"))
-    print(json.dumps({"type": "log", "message": _norm_log}), flush=True)
+        _v.save(os.path.join(_debug_dir, f"03b_bake_input_{_i}_{_n}.png"))
 
     # ── Background extension: push subject colour outward ─────────────────
     # Texels on the mesh silhouette boundary project onto view pixels right
@@ -1707,48 +1636,7 @@ def texture_mesh(args):
     if _final.ndim == 3 and _final.shape[2] in (3, 4):
         Image.fromarray(_final).save(os.path.join(_debug_dir, "06_inpainted_texture.png"))
 
-    # ── Inpaint blending: make filled holes match ON-MESH ──────────────────
-    # UV-inpaint fills are smooth and detail-free: seamless in the flat atlas
-    # photo but obvious on the mesh (mip filtering next to real projected
-    # weave — the "faces that don't blend" on inner arms / seat tops).
-    # Fix: graft the local high-frequency detail layer into the fills and
-    # feather their boundaries so patched faces read like their neighbours.
-    try:
-        import cv2 as _cv2_ib
-        _holes = (mask_np < 128).astype(np.uint8)
-        _hole_frac = float(_holes.mean())
-        if 0.0 < _hole_frac < 0.5:
-            _k3 = np.ones((3, 3), np.uint8)
-            # hole interior only; the 2-texel ring touching valid coverage
-            # already blends acceptably and is left alone
-            _holes_int = _holes & _cv2_ib.erode(_holes, _k3, iterations=2)
-            if _holes_int.sum() > 0:
-                _base = _final.astype(np.float32)
-                _k = int(max(5, (TEXTURE_SIZE // 512) * 5)) | 1
-                _kf = int(max(5, (TEXTURE_SIZE // 512) * 3)) | 1
-                _blur = _cv2_ib.GaussianBlur(_base, (_k, _k), 0)
-                _detail = _base - _blur
-                _det_img = np.clip(_detail + 128.0, 0, 255).astype(np.uint8)
-                _det_mask = (_cv2_ib.dilate(_holes_int, _k3, iterations=2) * 255).astype(np.uint8)
-                _det_inp = _cv2_ib.inpaint(
-                    _det_img, _det_mask, max(3, (TEXTURE_SIZE // 512) * 3),
-                    _cv2_ib.INPAINT_TELEA).astype(np.float32) - 128.0
-                _refined = np.clip(_blur + _det_inp, 0, 255)
-                _alpha = np.clip(_cv2_ib.GaussianBlur(
-                    _holes_int.astype(np.float32), (_kf, _kf), 0) * 1.5, 0.0, 1.0)[..., None]
-                _final = np.clip(_base * (1 - _alpha) + _refined * _alpha,
-                                 0, 255).astype(np.uint8)
-                print(json.dumps({"type": "log", "message":
-                    f"[texture] inpaint blending: hole_frac={_hole_frac:.3f} — "
-                    f"detail grafted + boundaries feathered"}), flush=True)
-    except Exception as _ib_err:
-        print(json.dumps({"type": "log", "message":
-            f"[texture] inpaint blending skipped: {_ib_err}"}), flush=True)
-
-    # Flatten texture: remove all shadows/highlights to produce flat albedo.
-    # Runs before final colour correction so the flatten doesn't undo the
-    # histogram matching.
-    # Flatten texture: RETIRED — normalization + delight handle lighting.
+    # Flatten texture: RETIRED — normalization and delight handle lighting.
     if False:  # flatten_texture removed
         try:
             _final_pil = Image.fromarray(_final)
@@ -1760,25 +1648,12 @@ def texture_mesh(args):
             print(json.dumps({"type": "log", "message":
                 f"[texture] flatten skipped: {_ft_err}"}), flush=True)
 
-    # Final colour correction: match the baked+inpainted texture's colour
-    # distribution to the original source image.  This catches any remaining
-    # drift from diffusion, baking, or inpainting and ensures the output
-    # palette matches what the user supplied.  The bake coverage mask keeps
-    # the statistics on real texels — inpainted filler and atlas padding
-    # would otherwise dilute the correction toward flat background colours.
-    try:
-        _final_pil = Image.fromarray(_final)
-        _fc_mask = mask_np > 127 if mask_np.shape[:2] == _final.shape[:2] else None
-        _final_pil = _histogram_match_pil(_final_pil, _source_histogram_ref,
-                                          mask=_fc_mask, strength=0.8)
-        _final = np.array(_final_pil)
-        # Update the texture tensor so the GLB export uses the corrected colours.
-        texture = torch.from_numpy(_final.astype(np.float32) / 255.0).to(texture.device)
-        print(json.dumps({"type": "log", "message":
-            "[texture] final colour correction applied (strength=0.8, baked texels only)"}), flush=True)
-    except Exception as _fc_err:
-        print(json.dumps({"type": "log", "message":
-            f"[texture] final colour correction skipped: {_fc_err}"}), flush=True)
+    # Do not histogram-match the finished atlas to the flat reference image:
+    # UV coordinates have no spatial relationship to photo pixels, and this
+    # global pass included background colors and washed out the baked albedo.
+    texture = torch.from_numpy(_final.astype(np.float32) / 255.0).to(texture.device)
+    print(json.dumps({"type": "log", "message":
+        "[texture] final atlas palette preserved; skipped spatially invalid global correction"}), flush=True)
 
     pipeline.render.set_texture(texture)
     textured_mesh = pipeline.render.save_mesh()

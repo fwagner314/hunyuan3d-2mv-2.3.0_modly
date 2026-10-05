@@ -1,4 +1,4 @@
-"""Hunyuan3D-2mv — first-load bridge (v2.2.0).
+"""Hunyuan3D-2mv — first-load bridge (v2.3.0).
 
 This module is the SINGLE place where anything living OUTSIDE the extension
 directory gets patched / bridged into shape. It runs inside the extension venv
@@ -53,7 +53,7 @@ import sys
 import time
 from pathlib import Path
 
-EXTENSION_VERSION = "2.2.0"
+EXTENSION_VERSION = "2.3.0"
 STATE_FILE = ".bridge_state.json"
 
 # subfolders each node needs, relative to that node's model dir

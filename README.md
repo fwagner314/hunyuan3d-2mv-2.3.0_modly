@@ -1,4 +1,4 @@
-# Hunyuan3D-2mv — Modly Extension (v2.3)
+# Hunyuan3D-2mv — Modly Extension (v2.3.1)
 
 Generate textured 3D meshes from images using Tencent's Hunyuan3D-2mv. Three nodes:
 
@@ -8,7 +8,11 @@ Generate textured 3D meshes from images using Tencent's Hunyuan3D-2mv. Three nod
 | **Texture Mesh** | Paints a texture onto an existing mesh using reference photos |
 | **Apply Texture** | Maps an existing UV atlas (e.g. externally super-resolved) onto a UV'd mesh — no diffusion |
 
-### What's new in v2.3
+### What's new in v2.3.1
+- **Compiler-free Windows install** — two bundled Python 3.11 wheels cover supported Maxwell/Pascal through Hopper and Blackwell GPUs. The installer selects the matching PyTorch/CUDA family, validates source and file checksums, without loading models or launching GPU computations during setup. Users do not need CUDA Toolkit or Visual Studio.
+- **Repeatable runtime** — PyTorch and its companion libraries are pinned per GPU family; the Windows dependency constraints and upstream Hunyuan source revision are pinned as well.
+
+### What was new in v2.3
 - **Texture color and UV repair** — the texture bridge preserves multiview color/exposure, avoids global atlas color matching, fixes the renderer mesh tuple order, and fills sparse UV charts using chart-local pixels with nearby 3D surface colors as fallback.
 
 ### What was new in v2.2
@@ -33,16 +37,55 @@ Generate textured 3D meshes from images using Tencent's Hunyuan3D-2mv. Three nod
 
 ---
 
-## CUDA Build Prerequisites
+## Compiler-free Windows installation (v2.3.1)
 
-Texture generation uses a native CUDA rasterizer compiled for the installed GPU during extension setup. Install these **before** installing or reinstalling the extension:
+Windows x64 installs use verified, versioned rasterizer wheels, matching Modly's
+Python 3.11 and the pinned PyTorch/CUDA runtime. Users need an NVIDIA display
+driver, not CUDA Toolkit or Visual Studio. Each wheel contains multiple GPU
+architectures; the newest target in each family also includes PTX.
+
+Two runtime families are provided: PyTorch 2.6.0/CUDA 12.4 for supported Maxwell
+through Hopper GPUs, and PyTorch 2.7.0/CUDA 12.8 for Blackwell (compute 10.0/12.0).
+An untested GPU/runtime fails before large dependency downloads instead of
+silently trying to compile on the user's machine. Dependency installs preserve
+the selected torch/torchvision/torchaudio versions using constraints.
+
+The two wheels and `rasterizer_wheels/index.json` are bundled with the extension,
+so normal installs do not require a separate GitHub release. Keep these files
+when uploading the repo. Do not upload `venv/`, build directories, or runtime
+state. If a bundle is absent, the installer can fetch the matching immutable
+`rasterizer-v1` release; it does not silently fall back to local compilation.
+
+Local validation: native imports and embedded architecture inspection passed
+for both wheel families; actual GPU/CPU rasterization comparison passed on an
+RTX 4050. GTX 1080/RTX 20/30/50-series hardware has not been physically tested
+in this validation. Broader compatibility still needs generation checks on representative GPUs.
+The release workflow can rebuild both wheels and create a draft release.
+
+### Linux and macOS (outside this Windows release)
+
+Windows wheels cannot run on Linux. Linux NVIDIA users currently need a
+source build, a matching CUDA Toolkit and
+C++ compiler. Compiler-free Linux requires separate tested Linux wheels.
+macOS has no supported NVIDIA CUDA path: the CPU/MPS shape path is separate,
+and texture generation needs a replacement renderer before it can be claimed
+supported. End-to-end macOS shape generation is not validated here.
+
+### Developer source builds
+
+Set `MODLY_BUILD_RASTERIZER=1` to opt into local compilation. This developer
+fallback is not required for supported Windows release installs.
+
+## CUDA Build Prerequisites (source builds only)
+
+Only explicit source builds compile the native CUDA rasterizer locally. For those builds, install:
 
 - An up-to-date NVIDIA display driver
 - The CUDA Toolkit matching the CUDA version selected by the extension's PyTorch wheel (normally CUDA 12.4 for pre-Blackwell GPUs and CUDA 12.8 for newer GPUs)
 - Visual Studio Build Tools with the **Desktop development with C++** workload
 - The Windows SDK included in that workload
 
-The CUDA Toolkit is required to build the rasterizer, not to run it after the build. It may be uninstalled after setup succeeds, but it must be installed again before a future extension reinstall or rebuild. The NVIDIA display driver must remain installed.
+The CUDA Toolkit is required only to build release binaries or perform explicit source builds. It may be uninstalled afterward. Normal installs and reinstalls from bundled wheels do not require it. The NVIDIA display driver must remain installed.
 
 If setup reports that `nvcc` or a C++ compiler is missing, install the prerequisites above and reinstall the extension. Setup detects the GPU capability, builds `custom_rasterizer_kernel`, and copies the resulting `.pyd` into the extension's virtual environment.
 
@@ -53,28 +96,42 @@ The installer chooses the PyTorch CUDA wheel from the GPU's compute capability, 
 | Compute capability | Typical GPU families | Installer path |
 |---|---|---|
 | `sm_20`–`sm_37` | Fermi / Kepler | Unsupported |
-| `sm_50`–`sm_62` | Maxwell / Pascal | PyTorch CUDA 12.4 |
-| `sm_70`–`sm_90` | Volta / Turing / Ampere / Ada / Hopper | PyTorch CUDA 12.4 |
+| `sm_50`, `sm_52`, `sm_60`, `sm_61` | Maxwell / Pascal (including GTX 1080) | PyTorch CUDA 12.4 |
+| `sm_70`, `sm_75`, `sm_80`, `sm_86`, `sm_89`, `sm_90` | Volta / Turing / Ampere / Ada / Hopper | PyTorch CUDA 12.4 |
 | `sm_100` / `sm_120` | Blackwell | PyTorch CUDA 12.8 |
 
 Hunyuan3D also needs approximately 6 GB or more of VRAM in practice; a GPU may be CUDA-compatible but still run out of memory during generation.
 
+## Installation behavior and repository contents
+
+`setup.py` creates or completes `venv/`, installs the pinned dependencies, and
+installs the matching bundled rasterizer. Normal setup does not initialize
+background-removal models or launch GPU computations. Models initialize during
+generation; a successful installation does not establish that generation will
+work on every supported GPU.
+
+Keep the runtime Python files, `manifest.json`, `runtime-constraints.txt`,
+`custom_rasterizer/`, and `rasterizer_wheels/`. The native source is also used to
+verify that bundled wheels match this revision. Keep `tools/` and the GitHub
+release workflow to rebuild binaries for future releases. Test scripts are
+excluded from this distribution.
+
+The local `venv/`, generated native kernel copies, Python caches, build folders,
+and runtime state are ignored by Git. Do not add them with `git add -f`. Keep
+`LICENSE` and the README with the published repository.
+
 ## Updating / Installing from GitHub
 
-This repo is the canonical source: `https://github.com/iammojogo-sudo/hunyuan3d-2mv-2.0.1_modly`
+This repo is the canonical source: `https://github.com/iammojogo-sudo/hunyuan3d-2mv-2.3.0_modly`
 
-1. **Install the CUDA build prerequisites above.**
-2. **Add the extension in Modly's Extensions tab** (paste the repo URL) — Modly downloads it and re-runs `setup.py`, which installs every dependency (torch, hy3dgen, rembg, …) and compiles the GPU-specific rasterizer into the isolated venv.
+1. **Keep an up-to-date NVIDIA driver installed.** Supported Windows release installs do not need compiler prerequisites.
+2. **Add the extension in Modly's Extensions tab** (paste the repo URL) — Modly downloads it and re-runs `setup.py`, which installs dependencies and the matching multi-architecture rasterizer into the isolated venv.
 3. **Download the model weights** in the Extensions → model view (per-node **Download** button) — ~15 GB total from public Hugging Face repos.
 4. **Model weights do not need re-downloading on updates** — they already live in Modly's `models/` folder; the first-load bridge links them into place automatically.
 
-For a manual install:
-
-```
-pip install https://github.com/iammojogo-sudo/hunyuan3d-2mv-2.0.1_modly/archive/refs/heads/main.zip
-```
-
-The manual package install also requires the CUDA build prerequisites above when texture generation is needed.
+Use Modly's extension installer for the complete isolated runtime and bundled
+rasterizer. A standalone `pip install` installs Python dependencies only; it
+does not create the Modly extension venv or install its native rasterizer.
 
 ## Background Removal (rembg)
 
@@ -232,7 +289,7 @@ unwrap tool first.
 - Set **Delight** to Off (saves ~1.5 GB VRAM)
 
 ### "CUDA Toolkit was not found" / rasterizer build failure
-Install the CUDA Toolkit, Visual Studio C++ Build Tools, and the Windows SDK before reinstalling the extension. The rasterizer is compiled during setup and cannot be repaired from a generic prebuilt binary after installation.
+Normal Windows installs use the bundled rasterizer wheels. Reinstall from a complete copy of this repo, including `rasterizer_wheels/`. If the bundled files are missing, a matching published release is required; users should not be asked to install compilers. Explicit developer source builds still require CUDA Toolkit, C++ Build Tools and the Windows SDK.
 
 ### "No CUDA GPUs are available"
 Kill lingering Python processes in Task Manager and restart Modly. If persistent, your GPU driver may need a reboot.

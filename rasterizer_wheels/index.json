@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "wheels": [
+    {
+      "filename": "custom_rasterizer-0.2.0+cu124-cp311-cp311-win_amd64.whl",
+      "sha256": "a5b395ca2c1664e03cf5271f2c64e2bba0010c3771fc79da4c3716735ee3559f",
+      "source_sha256": "9f699f1f6f7c6e9f70c984856c4e399736072236371427d271d7df8bd84601ae",
+      "python": "3.11",
+      "profile": "cu124",
+      "torch": "2.6.0+cu124",
+      "arches": [
+        50,
+        52,
+        60,
+        61,
+        70,
+        75,
+        80,
+        86,
+        89,
+        90
+      ]
+    },
+    {
+      "filename": "custom_rasterizer-0.2.0+cu128-cp311-cp311-win_amd64.whl",
+      "sha256": "600fbe247bc425161a4ae551237ffbfc882031e7deb659e96ef58c130b4cb8e6",
+      "source_sha256": "9f699f1f6f7c6e9f70c984856c4e399736072236371427d271d7df8bd84601ae",
+      "python": "3.11",
+      "profile": "cu128",
+      "torch": "2.7.0+cu128",
+      "arches": [
+        100,
+        120
+      ]
+    }
+  ]
+}

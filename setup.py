@@ -32,8 +32,10 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from rasterizer_distribution import resolve_wheel, install_wheel
 
-VERSION = "2.2.0"
+VERSION = "2.3.1"
+HY3DGEN_SOURCE = "https://github.com/Tencent/Hunyuan3D-2/archive/f8db63096c8282cb27354314d896feba5ba6ff8a.zip"
 
 # Directly imported by the bridges (beyond hy3dgen's own transitive deps).
 RUNTIME_DEPS = [
@@ -68,7 +70,12 @@ RUNTIME_DEPS = [
 def pip(venv: Path, *args: str) -> None:
     is_win = platform.system() == "Windows"
     pip_exe = venv / ("Scripts/pip.exe" if is_win else "bin/pip")
-    subprocess.run([str(pip_exe), *args], check=True)
+    constraints = venv / "modly-torch-constraints.txt"
+    extra = ["--constraint", str(constraints)] if args and args[0] == "install" and constraints.exists() else []
+    runtime_constraints = venv.parent / "runtime-constraints.txt"
+    if is_win and args and args[0] == "install" and runtime_constraints.exists():
+        extra.extend(["--constraint", str(runtime_constraints)])
+    subprocess.run([str(pip_exe), *args, *extra], check=True)
 
 
 def _site_packages(venv: Path, is_win: bool) -> Path:
@@ -121,7 +128,8 @@ def _build_custom_rasterizer(venv: Path, ext_dir: Path, gpu_sm: int, is_win: boo
 
     # Force a clean rebuild so changing GPUs or torch/CUDA versions cannot
     # leave an incompatible in-place binary behind.
-    for artifact in bundle.glob("custom_rasterizer_kernel*.pyd"):
+    kernel_pattern = "custom_rasterizer_kernel*.pyd" if is_win else "custom_rasterizer_kernel*.so"
+    for artifact in bundle.glob(kernel_pattern):
         artifact.unlink()
     build_dir = bundle / "build"
     if build_dir.exists():
@@ -138,9 +146,9 @@ def _build_custom_rasterizer(venv: Path, ext_dir: Path, gpu_sm: int, is_win: boo
         check=True,
     )
 
-    built = sorted(bundle.glob("custom_rasterizer_kernel*.pyd"))
+    built = sorted(bundle.glob(kernel_pattern))
     if not built:
-        raise RuntimeError("custom_rasterizer build completed without producing a .pyd")
+        raise RuntimeError("custom_rasterizer build completed without producing a native kernel")
 
     site_pkgs = _site_packages(venv, is_win)
 
@@ -156,21 +164,6 @@ def _build_custom_rasterizer(venv: Path, ext_dir: Path, gpu_sm: int, is_win: boo
     pth = site_pkgs / "hy3d_custom_rasterizer.pth"
     pth.write_text(str(dest) + "\n")
     print(f"[setup]   path file -> {pth}")
-
-
-def _predownload_rembg(venv: Path) -> None:
-    """Warm rembg's U²-Net cache (~170 MB) so first runs work offline."""
-    is_win = platform.system() == "Windows"
-    py = venv / ("Scripts/python.exe" if is_win else "bin/python")
-    code = ("from rembg import new_session;"
-            "s = new_session(providers=['CPUExecutionProvider']);"
-            "print('rembg u2net cached')")
-    try:
-        subprocess.run([str(py), "-c", code], check=True, timeout=900)
-        print("[setup] rembg u2net pre-downloaded (offline-ready).")
-    except Exception as e:
-        print(f"[setup] rembg u2net pre-download skipped ({e}). "
-              "First run with a background will fetch it (needs network).")
 
 
 def _torch_index_and_pkgs(gpu_sm: int, cuda_version: int, torch_flavor: str, is_mac: bool, is_win: bool):
@@ -220,7 +213,13 @@ def setup(
         else:
             accelerator = "cpu"
 
-    print(f"[setup] accelerator={accelerator}  gpu_sm={gpu_sm}  cuda_version={cuda_version}")
+    print(f"[setup] accelerator={accelerator}  gpu_sm={gpu_sm}  cuda_version={cuda_version}", flush=True)
+
+    prebuilt = None
+    build_from_source = os.environ.get("MODLY_BUILD_RASTERIZER") == "1"
+    if accelerator == "cuda" and is_win and not build_from_source:
+        # Resolve before creating a venv or downloading the large dependency set.
+        prebuilt = resolve_wheel(python_exe, ext_dir, gpu_sm)
 
     if venv.exists():
         print(f"[setup] venv already exists at {venv} — reusing it (Repair).")
@@ -229,6 +228,11 @@ def setup(
         subprocess.run([python_exe, "-m", "venv", str(venv)], check=True)
 
     torch_index, torch_pkgs = _torch_index_and_pkgs(gpu_sm, cuda_version, torch_flavor, is_mac, is_win)
+    constraints = venv / "modly-torch-constraints.txt"
+    if torch_index and all("==" in package for package in torch_pkgs):
+        constraints.write_text("\n".join(torch_pkgs) + "\n", encoding="utf-8")
+    elif constraints.exists():
+        constraints.unlink()
     if torch_index:
         print(f"[setup] Installing torch from {torch_index}: {torch_pkgs}")
         pip(venv, "install", *torch_pkgs, "--index-url", torch_index)
@@ -239,19 +243,26 @@ def setup(
     # hy3dgen (shapegen + texgen) from the Tencent Hunyuan3D-2 source.
     # Installed WITH its declared deps so the bridge imports cleanly.
     print("[setup] Installing hy3dgen from Tencent/Hunyuan3D-2 (source) …")
-    pip(venv, "install", "https://github.com/Tencent/Hunyuan3D-2/archive/refs/heads/main.zip")
+    pip(venv, "install", HY3DGEN_SOURCE)
 
     # Runtime deps for the orchestrator + bridge.
     print("[setup] Installing Hunyuan3D-2mv runtime deps …")
     pip(venv, "install", *RUNTIME_DEPS)
 
     # Warm rembg's U²-Net cache (~170 MB) so first runs work offline.
-    _predownload_rembg(venv)
+    print("[setup] Model initialization deferred until generation.", flush=True)
 
     # Build the texture renderer for this machine after torch is installed.
     # Texture generation needs this; shape generation does not.
     if accelerator == "cuda":
-        _build_custom_rasterizer(venv, ext_dir, gpu_sm, is_win)
+        if prebuilt:
+            install_wheel(venv, ext_dir, prebuilt)
+        elif build_from_source or not is_win:
+            _build_custom_rasterizer(venv, ext_dir, gpu_sm, is_win)
+        else:
+            raise RuntimeError("Prebuilt CUDA rasterizers currently target Windows x64. "
+                               "Linux source builds require MODLY_BUILD_RASTERIZER=1; "
+                               "a separately tested Linux release is required for compiler-free installation.")
     else:
         print("[setup] Non-CUDA accelerator: skipping custom_rasterizer build (texture needs NVIDIA CUDA).")
 
@@ -285,10 +296,11 @@ def _packaging_setup() -> None:
             "hunyuan3d_texture_bridge",
             "hunyuan3d_texture_apply_bridge",
             "hunyuan3d_bootstrap",
+            "rasterizer_distribution",
         ],
         include_package_data=True,
         install_requires=[
-            "hy3dgen @ https://github.com/Tencent/Hunyuan3D-2/archive/refs/heads/main.zip",
+            "hy3dgen @ " + HY3DGEN_SOURCE,
             "torch",
             "torchvision",
             "torchaudio",

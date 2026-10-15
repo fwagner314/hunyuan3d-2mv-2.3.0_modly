@@ -297,11 +297,11 @@ def repair_site_packages(ext_dir):
     _log(f"[bridge] custom_rasterizer validation failed: {err}")
     if not bundle.is_dir():
         _log("[bridge] custom_rasterizer bundle missing from extension dir — "
-             "texture gen needs it (reinstall with CUDA Toolkit installed)")
+             "texture gen needs it (reinstall the matching rasterizer release)")
         return False
-    if not list(bundle.glob("custom_rasterizer_kernel*.pyd")):
-        _log("[bridge] machine-specific custom_rasterizer .pyd is missing — "
-             "reinstall the extension with CUDA Toolkit and MSVC build tools installed")
+    if not (list(bundle.glob("custom_rasterizer_kernel*.pyd")) or list(bundle.glob("custom_rasterizer_kernel*.so"))):
+        _log("[bridge] matching custom_rasterizer native kernel is missing — "
+             "reinstall the extension to download the matching rasterizer release")
         return False
     dest = sp / "custom_rasterizer"
     try:

@@ -1,4 +1,5 @@
 from setuptools import setup, find_packages
+import os
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 # build custom rasterizer
@@ -13,7 +14,7 @@ custom_rasterizer_module = CUDAExtension('custom_rasterizer_kernel', [
 
 setup(
     packages=find_packages(),
-    version='0.1',
+    version=os.environ.get('MODLY_RASTERIZER_VERSION', '0.1'),
     name='custom_rasterizer',
     include_package_data=True,
     package_dir={'': '.'},
